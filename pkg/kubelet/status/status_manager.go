@@ -1243,21 +1243,29 @@ func (m *manager) syncBatch(ctx context.Context, all bool) int {
 // syncPod syncs the given status with the API server. The caller must not hold the status lock.
 func (m *manager) syncPod(ctx context.Context, uid types.UID, status versionedPodStatus) {
 	logger := klog.FromContext(ctx)
-	// TODO: make me easier to express from client code
-	pod, err := m.kubeClient.CoreV1().Pods(status.podNamespace).Get(ctx, status.podName, metav1.GetOptions{})
-	if errors.IsNotFound(err) {
-		logger.V(3).Info("Pod does not exist on the server",
-			"podUID", uid,
-			"pod", klog.KRef(status.podNamespace, status.podName))
-		// If the Pod is deleted the status will be cleared in
-		// RemoveOrphanedStatuses, so we just ignore the update here.
-		return
-	}
-	if err != nil {
-		logger.Error(err, "Failed to get status for pod",
-			"podUID", uid,
-			"pod", klog.KRef(status.podNamespace, status.podName))
-		return
+
+	// Prefer the informer-backed pod cache to avoid a GET round-trip per status
+	// sync. Static pods keep using the API GET so mirror-pod translation stays
+	// driven by the API server object, preserving the previous behavior.
+	pod, cached := m.podManager.GetPodByUID(uid)
+	if !cached || kubetypes.IsStaticPod(pod) {
+		// TODO: make me easier to express from client code
+		p, err := m.kubeClient.CoreV1().Pods(status.podNamespace).Get(ctx, status.podName, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			logger.V(3).Info("Pod does not exist on the server",
+				"podUID", uid,
+				"pod", klog.KRef(status.podNamespace, status.podName))
+			// If the Pod is deleted the status will be cleared in
+			// RemoveOrphanedStatuses, so we just ignore the update here.
+			return
+		}
+		if err != nil {
+			logger.Error(err, "Failed to get status for pod",
+				"podUID", uid,
+				"pod", klog.KRef(status.podNamespace, status.podName))
+			return
+		}
+		pod = p
 	}
 
 	translatedUID := m.podManager.TranslatePodUID(pod.UID)
