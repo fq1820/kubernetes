@@ -720,8 +720,10 @@ func NewMainKubelet(ctx context.Context,
 
 	klet.mirrorPodClient = kubepod.NewBasicMirrorClient(klet.kubeClient, string(nodeName), nodeLister)
 	klet.podManager = kubepod.NewBasicPodManager()
+	klet.terminalPods = newTerminalPodTracker()
 
 	klet.statusManager = status.NewManager(klet.kubeClient, klet.podManager, klet, kubeDeps.PodStartupLatencyTracker)
+	klet.statusManager.SetTerminalPodHandler(klet.forgetTerminalPodByUID)
 	klet.statusManager.SetTerminalPodDeletionClient(klet.heartbeatClient)
 
 	broadcaster := pods.NewBroadcaster(ctx)
@@ -1248,6 +1250,12 @@ type Kubelet struct {
 	// been force deleted or static pods that have been updated.
 	// https://github.com/kubernetes/kubernetes/issues/116970
 	podManager kubepod.Manager
+
+	// terminalPods tracks pods that have reached a terminal phase and no longer
+	// require local lifecycle tracking. It records when a terminal status has
+	// been synced and when the pod has been released from local state, so
+	// cleanup can reclaim the pod only after its worker has finished.
+	terminalPods *terminalPodTracker
 
 	// podWorkers is responsible for driving the lifecycle state machine of each pod. The worker is
 	// notified of config changes, updates, periodic reconciliation, container runtime updates, and
@@ -2887,6 +2895,15 @@ func (kl *Kubelet) HandlePodAdditions(ctx context.Context, pods []*v1.Pod) {
 	sort.Sort(sliceutils.PodsByCreationTime(pods))
 	var pendingResizes []types.UID
 	for _, pod := range pods {
+		// Terminal pods no longer require local lifecycle tracking. Drop them
+		// from local state and avoid creating a pod worker that would otherwise
+		// stay resident until the pod is deleted from the API server.
+		if podutil.IsPodPhaseTerminal(pod.Status.Phase) && !kubetypes.IsStaticPod(pod) {
+			kl.terminalPods.markReleased(pod.UID)
+			kl.forgetTerminalPod(ctx, pod)
+			continue
+		}
+
 		// Always add the pod to the pod manager. Kubelet relies on the pod
 		// manager as the source of truth for the desired state. If a pod does
 		// not exist in the pod manager, it means that it has been deleted in
@@ -2966,6 +2983,12 @@ func (kl *Kubelet) HandlePodUpdates(ctx context.Context, pods []*v1.Pod) {
 	start := kl.clock.Now()
 	logger := klog.FromContext(ctx)
 	for _, pod := range pods {
+		// A pod that has already been released from local tracking (terminal)
+		// must not be re-added by later config-source deliveries.
+		if kl.terminalPods.isReleased(pod.UID) {
+			continue
+		}
+
 		oldPod, _ := kl.podManager.GetPodByUID(pod.UID)
 		kl.podManager.UpdatePod(pod)
 
@@ -3132,6 +3155,7 @@ func (kl *Kubelet) HandlePodRemoves(ctx context.Context, pods []*v1.Pod) {
 	start := kl.clock.Now()
 	logger := klog.FromContext(ctx)
 	for _, pod := range pods {
+		kl.terminalPods.clear(pod.UID)
 		kl.podCertificateManager.ForgetPod(ctx, pod)
 		kl.podManager.RemovePod(pod)
 		kl.allocationManager.RemovePod(logger, pod.UID)
@@ -3163,6 +3187,26 @@ func (kl *Kubelet) HandlePodRemoves(ctx context.Context, pods []*v1.Pod) {
 	}
 }
 
+// forgetTerminalPod removes a terminal pod from the kubelet's local tracking
+// state. The pod remains in the API server, but is no longer retained in the
+// pod manager, allocation manager, or certificate manager. Its pod worker (if
+// any) is reclaimed by the next SyncKnownPods pass once it has finished.
+func (kl *Kubelet) forgetTerminalPod(ctx context.Context, pod *v1.Pod) {
+	logger := klog.FromContext(ctx)
+	kl.podManager.RemovePod(pod)
+	kl.allocationManager.RemovePod(logger, pod.UID)
+	kl.podCertificateManager.ForgetPod(ctx, pod)
+}
+
+// forgetTerminalPodByUID is invoked by the status manager after a pod's
+// terminal status has been successfully synced to the API server. It only
+// records that the status is synced; the pod is released from local tracking
+// by HandlePodCleanups once its pod worker has also finished, so no PLEG event
+// or status update can be lost.
+func (kl *Kubelet) forgetTerminalPodByUID(ctx context.Context, uid types.UID) {
+	kl.terminalPods.markSynced(uid)
+}
+
 // HandlePodReconcile is the callback in the SyncHandler interface for pods
 // that should be reconciled. Pods are reconciled when only the status of the
 // pod is updated in the API.
@@ -3173,6 +3217,12 @@ func (kl *Kubelet) HandlePodReconcile(ctx context.Context, pods []*v1.Pod) {
 	var triggerReason string
 	hasPendingResizes := kl.allocationManager.HasPendingResizes()
 	for _, pod := range pods {
+		// A pod that has already been released from local tracking (terminal)
+		// must not be re-added by later config-source deliveries.
+		if kl.terminalPods.isReleased(pod.UID) {
+			continue
+		}
+
 		// Update the pod in pod manager, status manager will do periodically reconcile according
 		// to the pod manager.
 		oldPod, _ := kl.podManager.GetPodByUID(pod.UID)
@@ -3271,6 +3321,12 @@ func (kl *Kubelet) HandlePodSyncs(ctx context.Context, pods []*v1.Pod) {
 	start := kl.clock.Now()
 	logger := klog.FromContext(ctx)
 	for _, pod := range pods {
+		// Terminal pods have been dropped from local tracking; there is nothing
+		// left to sync, so avoid re-dispatching them to pod workers.
+		if kl.terminalPods.isReleased(pod.UID) {
+			continue
+		}
+
 		pod, mirrorPod, wasMirror := kl.podManager.GetPodAndMirrorPod(pod)
 		if wasMirror {
 			if pod == nil {

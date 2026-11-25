@@ -1265,6 +1265,23 @@ func (kl *Kubelet) HandlePodCleanups(ctx context.Context) error {
 		allPodsByUID.Insert(pod.UID)
 	}
 
+	// Release terminal pods whose final status has been synced and whose pod
+	// worker has finished. This is the single point where a terminal pod is
+	// dropped from the pod manager, allocation manager, and certificate
+	// manager. Waiting for both conditions guarantees no runtime tail event or
+	// final status patch can be lost: the status manager reports the terminal
+	// status first, and the pod worker finishes SyncTerminatedPod afterwards.
+	for _, pod := range allPods {
+		if !kl.terminalPods.isSynced(pod.UID) {
+			continue
+		}
+		if kubetypes.IsStaticPod(pod) || !kl.podWorkers.ShouldPodBeFinished(pod.UID) {
+			continue
+		}
+		kl.terminalPods.markReleased(pod.UID)
+		kl.forgetTerminalPod(ctx, pod)
+	}
+
 	// Identify the set of pods that have workers, which should be all pods
 	// from config that are not terminated, as well as any terminating pods
 	// that have already been removed from config. Pods that are terminating

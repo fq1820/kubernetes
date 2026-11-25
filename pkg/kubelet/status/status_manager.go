@@ -87,6 +87,12 @@ type manager struct {
 	podStartupLatencyHelper PodStartupLatencyStateHelper
 	notifiers               []PodUpdateNotifier
 
+	// terminalPodHandler is invoked after a pod's terminal status has been
+	// successfully synced to the API server. It lets the kubelet release local
+	// tracking state (pod manager entry, pod worker, allocations) for finished
+	// pods without racing the runtime event stream.
+	terminalPodHandler func(ctx context.Context, uid types.UID)
+
 	// terminalDeleteClient deletes terminal pods without contending with the
 	// status-reporting client's rate limit. When nil, kubeClient is used.
 	terminalDeleteClient clientset.Interface
@@ -183,6 +189,11 @@ type Manager interface {
 	// a status update.
 	TerminatePod(logger klog.Logger, pod *v1.Pod)
 
+	// SetTerminalPodHandler registers a callback invoked after a pod's terminal
+	// status has been successfully synced to the API server. The kubelet uses it
+	// to release local tracking state for finished pods.
+	SetTerminalPodHandler(handler func(ctx context.Context, uid types.UID))
+
 	// SetTerminalPodDeletionClient registers the client used to delete terminal
 	// pods without contending with the status-reporting client's rate limit.
 	SetTerminalPodDeletionClient(deleteClient clientset.Interface)
@@ -225,6 +236,13 @@ type Manager interface {
 }
 
 const syncPeriod = 10 * time.Second
+
+// SetTerminalPodHandler stores the callback used to notify the kubelet after a
+// terminal status has been durably written to the API server. It is expected to
+// be called once before Start.
+func (m *manager) SetTerminalPodHandler(handler func(ctx context.Context, uid types.UID)) {
+	m.terminalPodHandler = handler
+}
 
 // SetTerminalPodDeletionClient stores the client used to delete terminal pods
 // without contending with the status-reporting client's rate limit. A nil
@@ -1389,6 +1407,9 @@ func (m *manager) syncPod(ctx context.Context, uid types.UID, status versionedPo
 		m.movePodStatusToTerminal(uid, status)
 		delete(m.apiStatusVersions, kubetypes.MirrorPodUID(pod.UID))
 		if !kubetypes.IsStaticPod(pod) {
+			if m.terminalPodHandler != nil {
+				m.terminalPodHandler(ctx, uid)
+			}
 			// The kubelet removes finished non-static pods itself instead of
 			// waiting for an external controller, so terminal pods do not
 			// accumulate and force O(n) reconciliation during large runs.
