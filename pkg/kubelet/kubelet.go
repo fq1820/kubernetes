@@ -722,6 +722,7 @@ func NewMainKubelet(ctx context.Context,
 	klet.podManager = kubepod.NewBasicPodManager()
 
 	klet.statusManager = status.NewManager(klet.kubeClient, klet.podManager, klet, kubeDeps.PodStartupLatencyTracker)
+	klet.statusManager.SetTerminalPodDeletionClient(klet.heartbeatClient)
 
 	broadcaster := pods.NewBroadcaster(ctx)
 	klet.podsServer = pods.NewPodsServer(broadcaster, klet.podManager, klet.statusManager, klet.sourcesReady)

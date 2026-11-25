@@ -71,7 +71,11 @@ type manager struct {
 	kubeClient clientset.Interface
 	podManager PodManager
 	// Map from pod UID to sync status of the corresponding pod.
-	podStatuses         map[types.UID]versionedPodStatus
+	podStatuses map[types.UID]versionedPodStatus
+	// Terminal pod statuses are kept out of podStatuses so they do not take
+	// part in bulk reconciliation, but are retained so later SetPodStatus calls
+	// can merge against the final state and reject illegal transitions.
+	podStatusesTerminal map[types.UID]versionedPodStatus
 	podResizeConditions map[types.UID]podResizeConditions
 	podStatusesLock     sync.RWMutex
 	podStatusChannel    chan struct{}
@@ -82,6 +86,10 @@ type manager struct {
 
 	podStartupLatencyHelper PodStartupLatencyStateHelper
 	notifiers               []PodUpdateNotifier
+
+	// terminalDeleteClient deletes terminal pods without contending with the
+	// status-reporting client's rate limit. When nil, kubeClient is used.
+	terminalDeleteClient clientset.Interface
 }
 
 type podResizeConditions struct {
@@ -175,6 +183,10 @@ type Manager interface {
 	// a status update.
 	TerminatePod(logger klog.Logger, pod *v1.Pod)
 
+	// SetTerminalPodDeletionClient registers the client used to delete terminal
+	// pods without contending with the status-reporting client's rate limit.
+	SetTerminalPodDeletionClient(deleteClient clientset.Interface)
+
 	// RemoveOrphanedStatuses scans the status cache and removes any entries for pods not included in
 	// the provided podUIDs.
 	RemoveOrphanedStatuses(logger klog.Logger, podUIDs map[types.UID]bool)
@@ -214,12 +226,20 @@ type Manager interface {
 
 const syncPeriod = 10 * time.Second
 
+// SetTerminalPodDeletionClient stores the client used to delete terminal pods
+// without contending with the status-reporting client's rate limit. A nil
+// client falls back to kubeClient.
+func (m *manager) SetTerminalPodDeletionClient(deleteClient clientset.Interface) {
+	m.terminalDeleteClient = deleteClient
+}
+
 // NewManager returns a functional Manager.
 func NewManager(kubeClient clientset.Interface, podManager PodManager, podDeletionSafety PodDeletionSafetyProvider, podStartupLatencyHelper PodStartupLatencyStateHelper) Manager {
 	return &manager{
 		kubeClient:              kubeClient,
 		podManager:              podManager,
 		podStatuses:             make(map[types.UID]versionedPodStatus),
+		podStatusesTerminal:     make(map[types.UID]versionedPodStatus),
 		podResizeConditions:     make(map[types.UID]podResizeConditions),
 		podStatusChannel:        make(chan struct{}, 1),
 		apiStatusVersions:       make(map[kubetypes.MirrorPodUID]uint64),
@@ -479,6 +499,9 @@ func (m *manager) GetPodStatus(uid types.UID) (v1.PodStatus, bool) {
 	m.podStatusesLock.RLock()
 	defer m.podStatusesLock.RUnlock()
 	status, ok := m.podStatuses[types.UID(m.podManager.TranslatePodUID(uid))]
+	if !ok {
+		status, ok = m.podStatusesTerminal[types.UID(m.podManager.TranslatePodUID(uid))]
+	}
 	return status.status, ok
 }
 
@@ -493,6 +516,16 @@ func (m *manager) SetPodStatus(logger klog.Logger, pod *v1.Pod, status v1.PodSta
 	m.podStatusesLock.Lock()
 	defer m.podStatusesLock.Unlock()
 
+	// A terminal pod has already been unbound from active reconciliation and its
+	// status can no longer change. The pod worker may still call this method with
+	// a redundant runtime status (for example a second SyncTerminatedPod report);
+	// queueing it again would move the status back into the terminal cache and
+	// delete apiStatusVersions after syncPod, churning between bound and unbound
+	// states. Ignore further updates for terminal pods to cut that loop entirely.
+	if cached, ok := m.podStatusesTerminal[pod.UID]; ok && podutil.IsPodPhaseTerminal(cached.status.Phase) {
+		return cached.status, false
+	}
+
 	// Make sure we're caching a deep copy.
 	status = *status.DeepCopy()
 
@@ -505,7 +538,13 @@ func (m *manager) SetPodStatus(logger klog.Logger, pod *v1.Pod, status v1.PodSta
 	changed, notif := m.updateStatusInternal(logger, pod, status, pod.DeletionTimestamp != nil, false)
 	notification = notif
 
-	return m.podStatuses[pod.UID].status, changed
+	if s, ok := m.podStatuses[pod.UID]; ok {
+		return s.status, changed
+	}
+	if s, ok := m.podStatusesTerminal[pod.UID]; ok {
+		return s.status, changed
+	}
+	return v1.PodStatus{}, changed
 }
 
 func (m *manager) SetContainerReadiness(logger klog.Logger, podUID types.UID, containerID kubecontainer.ContainerID, ready bool) {
@@ -733,7 +772,17 @@ func (m *manager) TerminatePod(logger klog.Logger, pod *v1.Pod) {
 	// was successful, always report an error
 	oldStatus := &pod.Status
 	cachedStatus, isCached := m.podStatuses[pod.UID]
+	fromTerminalCache := false
+	if !isCached {
+		cachedStatus, isCached = m.podStatusesTerminal[pod.UID]
+		fromTerminalCache = isCached
+	}
 	if isCached {
+		// A pod whose final status has already been moved out of active tracking
+		// was fully synced; there is nothing left to terminate.
+		if fromTerminalCache && podutil.IsPodPhaseTerminal(cachedStatus.status.Phase) {
+			return
+		}
 		oldStatus = &cachedStatus.status
 	}
 	status := *oldStatus.DeepCopy()
@@ -779,7 +828,6 @@ func (m *manager) TerminatePod(logger klog.Logger, pod *v1.Pod) {
 			if status.Phase == v1.PodRunning && isCached {
 				logger.Info("Terminal running pod should have already been marked as failed, programmer error", "pod", klog.KObj(pod), "podUID", pod.UID)
 			}
-			logger.V(3).Info("Marking terminal pod as failed", "oldPhase", status.Phase, "pod", klog.KObj(pod), "podUID", pod.UID)
 			status.Phase = v1.PodFailed
 		default:
 			logger.Error(fmt.Errorf("unknown phase: %v", status.Phase), "Unknown phase, programmer error", "pod", klog.KObj(pod), "podUID", pod.UID)
@@ -933,6 +981,9 @@ func checkContainerStateTransition(oldStatuses, newStatuses *v1.PodStatus, podSp
 func (m *manager) updateStatusInternal(logger klog.Logger, pod *v1.Pod, status v1.PodStatus, forceUpdate, podIsFinished bool) (bool, *podStatusNotification) {
 	var oldStatus v1.PodStatus
 	cachedStatus, isCached := m.podStatuses[pod.UID]
+	if !isCached {
+		cachedStatus, isCached = m.podStatusesTerminal[pod.UID]
+	}
 	if isCached {
 		oldStatus = cachedStatus.status
 		// TODO(#116484): Also assign terminal phase to static pods.
@@ -1127,11 +1178,10 @@ func updateLastTransitionTime(status, oldStatus *v1.PodStatus, conditionType v1.
 	condition.LastTransitionTime = lastTransitionTime
 }
 
-// deletePodStatus simply removes the given pod from the status cache.
-func (m *manager) deletePodStatus(uid types.UID) {
-	m.podStatusesLock.Lock()
-	defer m.podStatusesLock.Unlock()
-	delete(m.podStatuses, uid)
+// cleanupPodStatusBookkeepingLocked removes per-pod auxiliary state that is no
+// longer needed once the pod is no longer actively tracked.
+// Callers must hold podStatusesLock.
+func (m *manager) cleanupPodStatusBookkeepingLocked(uid types.UID) {
 	m.podStartupLatencyHelper.DeletePodStartupState(uid)
 	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
 		if conds, exists := m.podResizeConditions[uid]; exists {
@@ -1143,20 +1193,41 @@ func (m *manager) deletePodStatus(uid types.UID) {
 	}
 }
 
+// deletePodStatus removes the pod from both active and terminal status caches.
+func (m *manager) deletePodStatus(uid types.UID) {
+	m.podStatusesLock.Lock()
+	defer m.podStatusesLock.Unlock()
+	delete(m.podStatuses, uid)
+	delete(m.podStatusesTerminal, uid)
+	m.cleanupPodStatusBookkeepingLocked(uid)
+}
+
+// movePodStatusToTerminal moves a finished pod out of the actively reconciled
+// status map while retaining its final status for future merge checks.
+func (m *manager) movePodStatusToTerminal(uid types.UID, status versionedPodStatus) {
+	m.podStatusesLock.Lock()
+	defer m.podStatusesLock.Unlock()
+	m.podStatusesTerminal[uid] = status
+	delete(m.podStatuses, uid)
+	m.cleanupPodStatusBookkeepingLocked(uid)
+}
+
 // TODO(filipg): It'd be cleaner if we can do this without signal from user.
 func (m *manager) RemoveOrphanedStatuses(logger klog.Logger, podUIDs map[types.UID]bool) {
 	m.podStatusesLock.Lock()
 	defer m.podStatusesLock.Unlock()
-	for key := range m.podStatuses {
-		if _, ok := podUIDs[key]; !ok {
-			logger.V(5).Info("Removing pod from status map", "podUID", key)
-			delete(m.podStatuses, key)
-			if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
-				if conds, exists := m.podResizeConditions[key]; exists {
-					m.observeDeferredResizeDuration(key, conds.PodResizePending, metrics.DeferredResizeResolutionTerminated)
-					delete(m.podResizeConditions, key)
-					m.recordInProgressResizeCount()
-					m.observePendingResizeCount()
+	for _, statuses := range []map[types.UID]versionedPodStatus{m.podStatuses, m.podStatusesTerminal} {
+		for key := range statuses {
+			if _, ok := podUIDs[key]; !ok {
+				logger.V(5).Info("Removing pod from status map", "podUID", key)
+				delete(statuses, key)
+				if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+					if conds, exists := m.podResizeConditions[key]; exists {
+						m.observeDeferredResizeDuration(key, conds.PodResizePending, metrics.DeferredResizeResolutionTerminated)
+						delete(m.podResizeConditions, key)
+						m.recordInProgressResizeCount()
+						m.observePendingResizeCount()
+					}
 				}
 			}
 		}
@@ -1306,6 +1377,26 @@ func (m *manager) syncPod(ctx context.Context, uid types.UID, status versionedPo
 
 	m.apiStatusVersions[kubetypes.MirrorPodUID(pod.UID)] = status.version
 
+	// A terminal pod's status cannot change, so once it has been reported
+	// successfully the pod is unbound from local status maintenance. This avoids
+	// O(n) reconciliation overhead and reconcile storms for pods that will never
+	// change again. Only local caches are cleared; the API object and pod manager
+	// are left untouched here. Do not rely on podIsFinished, which is always
+	// false on the natural completion path; the terminal phase is authoritative.
+	if podutil.IsPodPhaseTerminal(mergedStatus.Phase) {
+		logger.V(3).Info("Pod reached terminal state and is unbound from status tracking",
+			"pod", klog.KObj(pod), "podUID", uid, "phase", mergedStatus.Phase)
+		m.movePodStatusToTerminal(uid, status)
+		delete(m.apiStatusVersions, kubetypes.MirrorPodUID(pod.UID))
+		if !kubetypes.IsStaticPod(pod) {
+			// The kubelet removes finished non-static pods itself instead of
+			// waiting for an external controller, so terminal pods do not
+			// accumulate and force O(n) reconciliation during large runs.
+			go m.deleteTerminalPod(pod)
+		}
+		return
+	}
+
 	// We don't handle graceful deletion of mirror pods.
 	if m.canBeDeleted(logger, pod, status.status, status.podIsFinished) {
 		deleteOptions := metav1.DeleteOptions{
@@ -1321,6 +1412,26 @@ func (m *manager) syncPod(ctx context.Context, uid types.UID, status versionedPo
 		}
 		logger.V(3).Info("Pod fully terminated and removed from etcd", "pod", klog.KObj(pod))
 		m.deletePodStatus(uid)
+	}
+}
+
+// deleteTerminalPod deletes a non-static pod whose final status has been
+// durably written to the API server. It mirrors the deletion performed by the
+// kubelet for pods with a deletion timestamp, but is triggered by reaching a
+// terminal phase rather than an explicit delete request.
+func (m *manager) deleteTerminalPod(pod *v1.Pod) {
+	logger := klog.Background()
+	client := m.terminalDeleteClient
+	if client == nil {
+		client = m.kubeClient
+	}
+	deleteOptions := metav1.DeleteOptions{
+		GracePeriodSeconds: new(int64),
+		Preconditions:      metav1.NewUIDPreconditions(string(pod.UID)),
+	}
+	err := client.CoreV1().Pods(pod.Namespace).Delete(context.Background(), pod.Name, deleteOptions)
+	if err != nil && !errors.IsNotFound(err) {
+		logger.Info("Failed to delete terminal pod", "pod", klog.KObj(pod), "err", err)
 	}
 }
 
