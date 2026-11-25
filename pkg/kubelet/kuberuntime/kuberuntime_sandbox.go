@@ -173,9 +173,9 @@ func (m *kubeGenericRuntimeManager) generatePodSandboxLinuxConfig(ctx context.Co
 
 			// Forcing sandbox to run as `runtime/default` allow users to
 			// use least privileged seccomp profiles at pod level. Issue #84623
-			Seccomp: &runtimeapi.SecurityProfile{
-				ProfileType: runtimeapi.SecurityProfile_RuntimeDefault,
-			},
+			// Seccomp: &runtimeapi.SecurityProfile{
+			// 	ProfileType: runtimeapi.SecurityProfile_RuntimeDefault,
+			// },
 		},
 	}
 
